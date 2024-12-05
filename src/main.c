@@ -1,5 +1,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <esp_log.h>
 #include <esp_sleep.h>
@@ -14,38 +15,32 @@
 #define TEMPO_DEEP_SLEEP 5000000 // 5 segundos (em microsegundos)
 #define TAG "MONITORAMENTO"
 
-// Mutex para proteger leituras de sensores
 SemaphoreHandle_t sensorMutex;
+QueueHandle_t sensorQueue;
 
-// Variáveis globais para energia total e custo
 float energia_total = 0.0;
-const float tarifa_kwh = 0.95; // Tarifa simulada em reais por kWh
+const float tarifa_kwh = 0.95;
 
-// Função para simular leitura de corrente
+
 float simular_corrente() {
-    return 0.05 + ((float)(rand() % 100) / 10); // Simula entre 0.05A e 15A
+    return 0.05 + ((float)(rand() % 1500) / 100); // Simula entre 0.05A e 15A
 }
 
-// Função para simular leitura de tensão
+
 float simular_tensao() {
-    return 210 + ((float)(rand() % 20)); // Simula entre 210V e 230V
+    return 127 + ((float)(rand() % 94)); // Simula entre 127V até 220V
 }
 
-// Função para calcular energia e custo
+
 void calcular_energia(float corrente, float tensao) {
-    // Calcula potência instantânea
     float potencia = corrente * tensao;
 
     // Calcula energia consumida em 5 segundos (5/3600 horas)
     float energia = potencia * (5.0 / 3600.0);
-
-    // Atualiza energia total
     energia_total += energia;
 
-    // Calcula o custo total
     float custo = energia_total * tarifa_kwh;
 
-    // Exibe os resultados
     ESP_LOGI(TAG, "Potência: %.2f W | Energia total: %.4f kWh | Custo: R$ %.2f",
              potencia, energia_total, custo);
 }
@@ -76,28 +71,48 @@ void carregar_energia_total() {
     }
 }
 
-// Função para medir corrente e tensão
-void medir_tarefa(void *pvParameters) {
-    float corrente, tensao;
-
-    // Inicializa a seed para a geração de números aleatórios com base no tempo atual
+// Tarefa 1: Simular sensores e enviar para a fila
+void simular_tarefa(void *pvParameters) {
+    float dados[2];
     struct timeval tv;
     gettimeofday(&tv, NULL);
-    srand(tv.tv_usec);
+    srand(tv.tv_usec); // Inicializa seed para números aleatórios
 
-    // Simula medições protegidas por mutex
+    // Protege leituras com mutex
     xSemaphoreTake(sensorMutex, portMAX_DELAY);
-    corrente = simular_corrente();
-    tensao = simular_tensao();
+    dados[0] = simular_corrente(); 
+    dados[1] = simular_tensao();   
     xSemaphoreGive(sensorMutex);
 
-    ESP_LOGI(TAG, "Corrente: %.2f A | Tensão: %.2f V", corrente, tensao);
+    // Envia os dados para a fila
+    if (xQueueSend(sensorQueue, &dados, portMAX_DELAY) == pdPASS) {
+        ESP_LOGI(TAG, "Dados enviados para a fila: Corrente = %.2f A, Tensão = %.2f V",
+                 dados[0], dados[1]);
+    }
 
-    // Calcula energia e custo
-    calcular_energia(corrente, tensao);
+    vTaskDelete(NULL); // Tarefa executada uma vez
+}
 
-    // Salva energia total no NVS
-    salvar_energia_total();
+// Tarefa 2: Processar dados da fila
+void processar_tarefa(void *pvParameters) {
+    float dados[2];
+    if (xQueueReceive(sensorQueue, &dados, pdMS_TO_TICKS(1000))) {
+        float corrente = dados[0];
+        float tensao = dados[1];
+
+        
+        calcular_energia(corrente, tensao);
+
+       
+        salvar_energia_total();
+    }
+
+    vTaskDelete(NULL); // Tarefa executada uma vez
+}
+
+// Tarefa 3: Gerenciar exibição e modo de economia de energia
+void gerenciar_tarefa(void *pvParameters) {
+    // ESP_LOGI(TAG, "Energia acumulada até agora: %.4f kWh", energia_total);
 
     // Configura deep sleep
     ESP_LOGI(TAG, "Entrando em deep sleep por 5 segundos...");
@@ -105,33 +120,42 @@ void medir_tarefa(void *pvParameters) {
     esp_deep_sleep_start();
 }
 
-// Função principal
+
 void app_main() {
-    // Inicializa NVS
+    
     esp_err_t ret = nvs_flash_init();
     if (ret != ESP_OK && ret != ESP_ERR_NVS_NO_FREE_PAGES) {
         ESP_LOGE(TAG, "Erro ao inicializar NVS");
         return;
     }
 
-    // Inicializa mutex
+    
     sensorMutex = xSemaphoreCreateMutex();
     if (sensorMutex == NULL) {
-        ESP_LOGE(TAG, "Falha ao criar o mutex");
+        ESP_LOGE(TAG, "Falha ao criar mutex");
         return;
     }
 
-    // Carrega energia total do NVS
+    
+    sensorQueue = xQueueCreate(10, sizeof(float[2]));
+    if (sensorQueue == NULL) {
+        ESP_LOGE(TAG, "Falha ao criar fila");
+        return;
+    }
+
+    
     carregar_energia_total();
 
-    // Detecta se o ESP acordou do deep sleep
+    
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
         ESP_LOGI(TAG, "ESP acordou do deep sleep");
     } else {
         ESP_LOGI(TAG, "Inicializando o sistema pela primeira vez");
-        energia_total = 0.0; // Inicializa energia total como 0 na primeira execução
+        energia_total = 0.0; // Inicializa energia total como 0
     }
 
-    // Cria a tarefa para medições
-    xTaskCreate(medir_tarefa, "MedirTarefa", 2048, NULL, 5, NULL);
+    
+    xTaskCreate(simular_tarefa, "SimularTarefa", 2048, NULL, 5, NULL);
+    xTaskCreate(processar_tarefa, "ProcessarTarefa", 2048, NULL, 5, NULL);
+    xTaskCreate(gerenciar_tarefa, "GerenciarTarefa", 2048, NULL, 5, NULL);
 }
